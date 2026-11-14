@@ -1,0 +1,195 @@
+#==========================================================================
+# Firefly AIO-3568J —— 一体式整机固件（官方 FnNAS 镜像 + 自编内核 + 本板 dtb）
+#
+# 与 build-fnnas-kernel.yml 的分工：
+#   * build-fnnas-kernel.yml 产出 <ver>-rockchip.tar.gz（fnnas-update 用）
+#   * 本工作流直接把该内核的 boot/modules/dtbs 烤进官方 rockchip 镜像，
+#     产出可直接写入设备的整机 .img.xz（自带 u-boot，裸写 0 偏移即可开机）
+#==========================================================================
+
+name: Build Full Flashable Image (AIO-3568J)
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-full-image.yml'
+      - 'scripts/build-full-image.sh'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "内核版本（对应 kernel_fnnas Release 里的资产）"
+        required: true
+        default: "6.18.63"
+      fnnas_base_version:
+        description: "FnNAS 官方基础镜像"
+        required: true
+        default: "rockchip_1253"
+        type: choice
+        options:
+          - rockchip_1253
+          - rockchip_692
+
+env:
+  TZ: Etc/UTC
+  KVER: ${{ inputs.kernel_version || '6.18.63' }}
+  LOG_DIR: /builder/logs
+
+jobs:
+  full-image:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 240
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install xz-utils util-linux e2fsprogs jq curl ca-certificates
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
+          date -u
+          for t in losetup mount xz jq; do command -v "$t" || { echo "missing $t"; exit 1; }; done
+
+      - name: Create virtual disk for extended storage
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G"; exit 1; }
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder "${LOG_DIR}"
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+
+      - name: Fetch self-built kernel package from release
+        id: pkg
+        working-directory: /builder
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/01-pkg.log"
+          url="https://github.com/${{ github.repository }}/releases/download/kernel_fnnas/${KVER}-rockchip.tar.gz"
+          echo "kernel package: ${url}" | tee "${LOG}"
+          curl -fsSL --retry 5 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "${url}" -o "/builder/${KVER}-rockchip.tar.gz" 2>&1 | tail -3 | tee -a "${LOG}"
+          mkdir -p /builder/pkg
+          tar -xf "/builder/${KVER}-rockchip.tar.gz" -C /builder/pkg
+          pdir="$(find /builder/pkg -maxdepth 2 -name 'boot-rockchip-*.tar.gz' -printf '%h\n' | head -1)"
+          [[ -n "${pdir}" ]] || { echo "Error: kernel package layout unexpected."; exit 1; }
+          ls -lh "${pdir}" | tee -a "${LOG}"
+          echo "pkgdir=${pdir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and extract official FnNAS image
+        id: img
+        working-directory: /builder
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/02-image.log"
+          board="${{ inputs.fnnas_base_version || 'rockchip_1253' }}"
+          latest=$(curl -s -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/ophub/fnnas/releases?per_page=20" | \
+              jq -r --arg RTK "fnnas_base_image" --arg BOARD "${board}" \
+              '[.[] | select(.tag_name | contains($RTK))] |
+               map(.assets[] | select(.name | contains($BOARD) and endswith(".img.xz"))) |
+               sort_by(.updated_at) | reverse | .[0] | {url: .url, name: .name}')
+          [[ -z "${latest}" || "${latest}" == "null" ]] && { echo "Error: cannot resolve FnNAS image."; exit 1; }
+          img_url="$(echo "${latest}" | jq -r '.url')"
+          img_name="$(echo "${latest}" | jq -r '.name')"
+          echo "image: ${img_name}" | tee "${LOG}"
+          curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" \
+            "${img_url}" -o "/builder/${img_name}" 2>&1 | tail -3 | tee -a "${LOG}"
+          echo "decompressing..." | tee -a "${LOG}"
+          xz -d -T0 "/builder/${img_name}"
+          img_path="/builder/${img_name%.xz}"
+          ls -lh "${img_path}" | tee -a "${LOG}"
+          df -Th | tee -a "${LOG}"
+          echo "img=${img_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Bake kernel into image
+        id: bake
+        working-directory: /builder
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/03-bake.log"
+          mkdir -p /builder/out
+          sudo bash "${{ github.workspace }}/scripts/build-full-image.sh" \
+            "${{ steps.img.outputs.img }}" "${{ steps.pkg.outputs.pkgdir }}" /builder/out 2>&1 | tee "${LOG}"
+          ls -lh /builder/out | tee -a "${LOG}"
+
+      - name: Verify built image
+        id: verify
+        if: ${{ always() }}
+        run: |
+          LOG="${LOG_DIR}/04-verify.log"
+          set +e
+          {
+            echo "==== verify ===="
+            ls -lh /builder/out 2>/dev/null
+            cat /builder/out/report.txt 2>/dev/null
+            imgxz="$(ls /builder/out/*.img.xz 2>/dev/null | head -1)"
+            if [[ -n "${imgxz}" ]]; then
+              du -h "${imgxz}"
+              xz -l "${imgxz}" || true
+              echo "OK: ${imgxz}"
+            else
+              echo "ERROR: no image produced"
+            fi
+          } 2>&1 | tee "${LOG}"
+          if [[ -n "$(ls /builder/out/*.img.xz 2>/dev/null)" ]]; then
+            echo "status=success" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Publish full image to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ always() && !cancelled() && steps.verify.outputs.status == 'success' }}
+        with:
+          tag: full_image
+          artifacts: /builder/out/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - 一体式整机固件：FnNAS 官方 rockchip 镜像 + 自编内核 ${{ inputs.kernel_version || '6.18.63' }}
+              + Firefly AIO-3568J 专属设备树 `rk3568-firefly-aioj.dtb`。
+            - 写入方式：rkdeveloptool `wl 0 <img>`；裸片先 `db MiniLoaderAll.bin` 再 `ul`。
+            - Self-built kernel baked into official FnNAS image for Firefly AIO-3568J.
+
+      - name: Bundle build logs
+        if: ${{ always() }}
+        run: |
+          mkdir -p "${LOG_DIR}"
+          {
+            echo "run_id: ${{ github.run_id }}"
+            echo "job_status: ${{ job.status }}"
+            echo "kernel: ${KVER}"
+            echo
+            ls -lh "${LOG_DIR}" || true
+          } > "${LOG_DIR}/00-summary.txt"
+          ( cd "${LOG_DIR}" && tar -czf /builder/image-build-logs.tar.gz . ) || true
+          ls -lh /builder/image-build-logs.tar.gz || true
+
+      - name: Publish build logs
+        if: ${{ always() && !cancelled() }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: build-logs-image
+          artifacts: /builder/image-build-logs.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - Full-image build logs of run ${{ github.run_id }} (status: ${{ job.status }}).
