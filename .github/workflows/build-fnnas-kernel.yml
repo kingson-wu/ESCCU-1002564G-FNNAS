@@ -1,25 +1,15 @@
 #==========================================================================
 # Firefly AIO-3568J (RK3568J) —— 自编 FnNAS 6.18.y 内核包
 #
-# 与"只补 dtb"版本的区别：这一版**自己编内核**。
-#   - 源码：kernel.org 6.18.y（版本由输入决定，默认 6.18.63）
-#   - config：仓库内 config/config-<ver>-ophub（取自 ophub 官方 6.18.63 内核包，
-#     等价于 FnNAS 现用内核的配置）+ config/aioj.fragment（本板裁剪）
-#   - 专属设备树：dts/rk3568-firefly-aioj.dts 直接编进源码树，随 linux-image
-#     deb 落到 /usr/lib/linux-image-<ver>/rockchip/，安装后即
-#     /boot/dtb/rockchip/rk3568-firefly-aioj.dtb
-#   - 打包：用 ophub/fnnas 的 rekernel 把「自编内核 deb + 官方 FnNAS 镜像 +
-#     官方 dtbs + 模块」封成 <ver>-rockchip.tar.gz（fnnas-update 可直接装）
-#
-# 关于 debs：rekernel 默认会去 GitHub 下载官方 debs。我们在自己 clone 的
-# rekernel 副本里加了 guard（见 "Inject ... patch rekernel" 步骤），检测到
-# fnnas-debs/.self_built 就跳过官方下载、只用自编 deb，避免两份内核打架。
+# 流程：kernel 源码 → 基线 config + 本板片段 → 编 Image/modules/dtbs
+#       → 打 deb（bindeb-pkg，失败时自动放宽 debhelper-compat 重试）
+#       → ophub/fnnas 的 rekernel 封装成 <ver>-rockchip.tar.gz
+#       → 校验 + 发 Release(kernel_fnnas)；日志打包发 Release(build-logs)
 #==========================================================================
 
 name: Build FnNAS Kernel (self-built) for AIO-3568J
 
 on:
-  # 推送以下文件即自动触发（方便在不方便手动点 Run workflow 时自动开跑）
   push:
     paths:
       - '.github/workflows/build-fnnas-kernel.yml'
@@ -28,11 +18,11 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "内核源码版本（默认 6.18.63，即当前 ophub 6.18.y 最新）"
+        description: "内核源码版本（默认 6.18.63）"
         required: true
         default: "6.18.63"
       dtbs_version:
-        description: "告诉 rekernel 的内核系列（决定官方 dtbs 与 deb 匹配）"
+        description: "内核系列（决定官方 dtbs/deb 匹配）"
         required: true
         default: "6.18.y"
       fnnas_base_version:
@@ -49,6 +39,7 @@ env:
   DTB_NAME: rk3568-firefly-aioj
   KVER: ${{ inputs.kernel_version || '6.18.63' }}
   SERIES: ${{ inputs.dtbs_version || '6.18.y' }}
+  LOG_DIR: /builder/logs
 
 jobs:
   build:
@@ -56,7 +47,6 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write
-    name: selfbuilt-kernel:${{ inputs.kernel_version || '6.18.63' }}@${{ inputs.fnnas_base_version || 'rockchip_1253' }}
 
     steps:
       - name: Checkout
@@ -74,9 +64,14 @@ jobs:
           sudo rm -f /swapfile /mnt/swapfile
           sudo apt-get -y update
           sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
-          # ophub 官方依赖集（含 bison/flex/dtc/libssl-dev/fakeroot 等）
+          # ophub 官方依赖集
           sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2604-make-fnnas-depends)
-          sudo apt-get -y install device-tree-compiler dpkg-dev fakeroot zstd
+          # 额外：deb 打包依赖（bindeb-pkg 的 dpkg-checkbuilddeps 需要）
+          #   debhelper -> 提供 debhelper-compat (= 12)
+          #   libdw-dev -> libdw-dev:native
+          #   dwarves   -> pahole，BTF 生成
+          sudo apt-get -y install debhelper libdw-dev dwarves libelf-dev \
+            device-tree-compiler dpkg-dev fakeroot zstd bc bison flex libssl-dev
           sudo systemctl daemon-reload
           sudo apt-get -y autoremove --purge
           sudo apt-get clean
@@ -85,6 +80,7 @@ jobs:
           sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
           date -u
           echo "nproc=$(nproc)"
+          command -v pahole || echo "warn: pahole missing"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Create virtual disk for extended storage
@@ -97,43 +93,40 @@ jobs:
           build_dev=$(sudo losetup --find --show /root.img)
           echo "Using /: ${root_size}G"
           sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
-          sudo mkdir -p /builder
+          sudo mkdir -p /builder "${LOG_DIR}"
           sudo mount "${build_dev}" /builder
           sudo chown -R runner:runner /builder
           df -Th
 
-      # ----------------------------------------------------------------
-      # 1) 下载源码 + 组装 config
-      # ----------------------------------------------------------------
       - name: Fetch kernel source and prepare config
         id: prep
         working-directory: /builder
         run: |
-          set -euo pipefail
+          set -eo pipefail
+          mkdir -p "${LOG_DIR}"
+          LOG="${LOG_DIR}/01-prep.log"
           MIRROR_CN="https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x"
           MIRROR_ORG="https://cdn.kernel.org/pub/linux/kernel/v6.x"
 
           for m in "${MIRROR_CN}" "${MIRROR_ORG}"; do
-            echo "Downloading linux-${KVER}.tar.xz from ${m}"
-            if curl -fsSL --retry 3 --retry-delay 5 "${m}/linux-${KVER}.tar.xz" -o "linux-${KVER}.tar.xz"; then
+            echo "Downloading linux-${KVER}.tar.xz from ${m}" | tee -a "${LOG}"
+            if curl -fsSL --retry 3 --retry-delay 5 "${m}/linux-${KVER}.tar.xz" -o "linux-${KVER}.tar.xz" 2>&1 | tee -a "${LOG}"; then
               break
             fi
           done
           [[ -s "linux-${KVER}.tar.xz" ]] || { echo "Error: kernel source download failed."; exit 1; }
-          tar -xf "linux-${KVER}.tar.xz"
+          tar -xf "linux-${KVER}.tar.xz" 2>&1 | tail -3 | tee -a "${LOG}"
           cd "linux-${KVER}"
-          echo "Source ready: $(pwd), kernelrelease -> ${KVER}-ophub"
 
-          # 基线 config：优先仓库自带；没有则从 ophub/kernel 拉同版本内核包取 config
           base_cfg="${{ github.workspace }}/config/config-${KVER}-ophub"
           if [[ -f "${base_cfg}" ]]; then
             cp -f "${base_cfg}" .config
-            echo "Use repo baseline config: ${base_cfg}"
+            echo "Use repo baseline config: ${base_cfg}" | tee -a "${LOG}"
           else
-            echo "Baseline config for ${KVER} not in repo, downloading from ophub/kernel..."
+            echo "Baseline config not in repo, downloading from ophub/kernel..." | tee -a "${LOG}"
             curl -fsSL --retry 5 \
               "https://github.com/ophub/kernel/releases/download/kernel_stable/${KVER}.tar.gz" \
-              -o "/builder/ophub-${KVER}.tar.gz"
+              -o "/builder/ophub-${KVER}.tar.gz" 2>&1 | tail -3 | tee -a "${LOG}"
             mkdir -p /builder/ophub-kernel && tar -xf "/builder/ophub-${KVER}.tar.gz" -C /builder/ophub-kernel
             boot_tar="$(find /builder/ophub-kernel -maxdepth 3 -name "boot-${KVER}-ophub.tar.gz" | head -1)"
             [[ -n "${boot_tar}" ]] || { echo "Error: ophub boot package not found."; exit 1; }
@@ -141,22 +134,20 @@ jobs:
             cp -f "/builder/ophub-boot/config-${KVER}-ophub" .config
           fi
 
-          # 合并本板裁剪片段
-          scripts/kconfig/merge_config.sh -m -O . .config "${{ github.workspace }}/config/aioj.fragment"
-          make ARCH=arm64 olddefconfig
+          scripts/kconfig/merge_config.sh -m -O . .config "${{ github.workspace }}/config/aioj.fragment" 2>&1 | tee -a "${LOG}" | tail -20
+          make ARCH=arm64 olddefconfig 2>&1 | tail -5 | tee -a "${LOG}"
 
-          echo "==== 关键 config 生效情况 ===="
-          for k in CONFIG_LOCALVERSION CONFIG_DRM_ROCKCHIP CONFIG_DRM_PANEL_ILITEK_ILI9881C \
-                   CONFIG_DRM_PANEL_SIMPLE CONFIG_TOUCHSCREEN_GOODIX CONFIG_USB_RTL8152 \
-                   CONFIG_USB_NET_AX8817X CONFIG_USB_NET_CDC_MBIM CONFIG_USB_NET_QMI_WWAN \
-                   CONFIG_USB_SERIAL_OPTION CONFIG_CAN_MCP251X CONFIG_DRM_DW_MIPI_DSI; do
-            printf "%-40s %s\n" "${k}" "$(grep -E "^${k}=" .config || echo '(unset)')"
-          done
+          {
+            echo "==== 关键 config 生效情况 ===="
+            for k in CONFIG_LOCALVERSION CONFIG_DRM_ROCKCHIP CONFIG_DRM_PANEL_ILITEK_ILI9881C \
+                     CONFIG_DRM_PANEL_SIMPLE CONFIG_TOUCHSCREEN_GOODIX CONFIG_USB_RTL8152 \
+                     CONFIG_USB_NET_AX8817X CONFIG_USB_NET_CDC_MBIM CONFIG_USB_NET_QMI_WWAN \
+                     CONFIG_USB_SERIAL_OPTION CONFIG_CAN_MCP251X CONFIG_DRM_DW_MIPI_DSI; do
+              printf "%-40s %s\n" "${k}" "$(grep -E "^${k}=" .config || echo '(unset)')"
+            done
+          } | tee -a "${LOG}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ----------------------------------------------------------------
-      # 2) 专属 dts 进源码树（dtb 随 deb 装到 /usr/lib/linux-image-<ver>/rockchip/）
-      # ----------------------------------------------------------------
       - name: Add board-specific DTS into kernel tree
         id: dts
         working-directory: /builder
@@ -166,41 +157,48 @@ jobs:
           cp "${{ github.workspace }}/dts/${DTB_NAME}.dts" "arch/arm64/boot/dts/rockchip/${DTB_NAME}.dts"
           grep -q "${DTB_NAME}.dtb" arch/arm64/boot/dts/rockchip/Makefile || \
             echo "dtb-\$(CONFIG_ARCH_ROCKCHIP) += ${DTB_NAME}.dtb" >> arch/arm64/boot/dts/rockchip/Makefile
-          tail -3 arch/arm64/boot/dts/rockchip/Makefile
+          tail -3 arch/arm64/boot/dts/rockchip/Makefile | tee -a "${LOG_DIR}/02-dts.log"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ----------------------------------------------------------------
-      # 3) 编内核 + 模块 + dtbs，再打 deb
-      # ----------------------------------------------------------------
       - name: Build kernel, modules and dtbs
         working-directory: /builder/linux-${{ inputs.kernel_version || '6.18.63' }}
         run: |
-          set -e
-          make ARCH=arm64 -j"$(nproc)" Image modules dtbs 2>&1 | tail -40
-          ls -lh arch/arm64/boot/Image
-          find arch/arm64/boot/dts -name "${DTB_NAME}.dtb" -exec ls -lh {} \;
+          set -eo pipefail
+          LOG="${LOG_DIR}/03-build.log"
+          make ARCH=arm64 -j"$(nproc)" Image modules dtbs 2>&1 | tee "${LOG}" | tail -40
+          ls -lh arch/arm64/boot/Image | tee -a "${LOG}"
+          find arch/arm64/boot/dts -name "${DTB_NAME}.dtb" -exec ls -lh {} \; | tee -a "${LOG}"
 
       - name: Package kernel as deb
         working-directory: /builder/linux-${{ inputs.kernel_version || '6.18.63' }}
         run: |
-          set -e
-          make ARCH=arm64 bindeb-pkg KDEB_PKGVERSION="${KVER}-ophub-1" 2>&1 | tail -40
-          ls -lh /builder/*.deb
+          set -eo pipefail
+          LOG="${LOG_DIR}/04-deb.log"
+          echo "==== bindeb-pkg ====" | tee "${LOG}"
+          if make ARCH=arm64 bindeb-pkg KDEB_PKGVERSION="${KVER}-ophub-1" 2>&1 | tee -a "${LOG}" | tail -40; then
+            echo "bindeb-pkg ok" | tee -a "${LOG}"
+          else
+            echo "!! bindeb-pkg failed, relaxing debhelper-compat and retrying dpkg-buildpackage" | tee -a "${LOG}"
+            if [[ -f debian/control ]]; then
+              sed -i -E 's/debhelper-compat \(= [0-9]+\)/debhelper-compat (= 13)/' debian/control
+              grep -n "debhelper" debian/control | tee -a "${LOG}"
+            fi
+            dpkg-buildpackage --build=binary --no-pre-clean --unsigned-changes \
+              -R'make -f debian/rules' -j"$(nproc)" -a"$(cat debian/arch)" 2>&1 | tee -a "${LOG}" | tail -40
+          fi
+          ls -lh /builder/*.deb | tee -a "${LOG}"
 
-      # ----------------------------------------------------------------
-      # 4) 准备 rekernel 环境（脚本 + 官方镜像）
-      # ----------------------------------------------------------------
       - name: Clone packaging scripts and download FnNAS image
         id: pack_prep
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          git clone --depth 1 https://github.com/ophub/fnnas.git fnnas-src
+          set -eo pipefail
+          LOG="${LOG_DIR}/05-packprep.log"
+          git clone --depth 1 https://github.com/ophub/fnnas.git fnnas-src 2>&1 | tail -3 | tee "${LOG}"
           cd fnnas-src
           mkdir -p fnnas-arm64 fnnas-debs/rockchip fnnas-dtbs/rockchip
 
-          echo "Downloading the latest FnNAS base image..."
           board="${{ inputs.fnnas_base_version || 'rockchip_1253' }}"
           latest=$(curl -s -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GITHUB_TOKEN}" \
@@ -212,66 +210,71 @@ jobs:
           [[ -z "${latest}" || "${latest}" == "null" ]] && { echo "Error: cannot resolve FnNAS image."; exit 1; }
           img_url="$(echo "${latest}" | jq -r '.url')"
           img_name="$(echo "${latest}" | jq -r '.name')"
+          echo "image: ${img_name}" | tee -a "${LOG}"
           curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" \
-            "${img_url}" -o "fnnas-arm64/${img_name}"
-          ls -lh fnnas-arm64/
+            "${img_url}" -o "fnnas-arm64/${img_name}" 2>&1 | tail -3 | tee -a "${LOG}"
+          ls -lh fnnas-arm64/ | tee -a "${LOG}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Inject self-built debs and DTB, patch rekernel
         id: inject
         run: |
-          set -e
+          set -eo pipefail
+          LOG="${LOG_DIR}/06-inject.log"
           cd fnnas-src
           cp -f /builder/*.deb fnnas-debs/rockchip/
           touch fnnas-debs/.self_built
           cp -f "${{ github.workspace }}/prebuilt/${DTB_NAME}.dtb" fnnas-dtbs/rockchip/ 2>/dev/null || true
-          ls -l fnnas-debs/rockchip/
-
-          python3 "${{ github.workspace }}/scripts/patch-rekernel.py" rekernel
-          grep -n -A3 "Self-built debs detected" rekernel
+          ls -l fnnas-debs/rockchip/ | tee "${LOG}"
+          python3 "${{ github.workspace }}/scripts/patch-rekernel.py" rekernel 2>&1 | tee -a "${LOG}"
+          grep -n -A3 "Self-built debs detected" rekernel | tee -a "${LOG}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Compile FnNAS kernel package
         id: rekernel
         working-directory: ${{ github.workspace }}/fnnas-src
         run: |
-          set -e
-          sudo ./rekernel -r "${{ github.repository }}" -e rockchip -t true -k "${SERIES}" 2>&1 | tail -90
-          ls -lh fnnas/out/
+          set -eo pipefail
+          LOG="${LOG_DIR}/07-rekernel.log"
+          sudo ./rekernel -r "${{ github.repository }}" -e rockchip -t true -k "${SERIES}" 2>&1 | tee "${LOG}" | tail -90
+          ls -lh fnnas/out/ | tee -a "${LOG}"
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      # ----------------------------------------------------------------
-      # 5) 产物校验
-      # ----------------------------------------------------------------
       - name: Verify kernel package contents
-        if: ${{ steps.rekernel.outputs.status == 'success' }}
+        id: verify
+        if: ${{ always() }}
         run: |
-          set -e
+          LOG="${LOG_DIR}/08-verify.log"
           out="${{ github.workspace }}/fnnas-src/fnnas/out"
-          pkg="$(ls "${out}"/*-rockchip.tar.gz | head -1)"
-          echo "Package: ${pkg}"
-          rm -rf /tmp/chk && mkdir -p /tmp/chk
-          tar -xf "${pkg}" -C /tmp/chk
-
-          dtbtar="$(find /tmp/chk -name 'dtb-rockchip-*.tar.gz' | head -1)"
-          if tar -tzf "${dtbtar}" | grep -qx "${DTB_NAME}.dtb"; then
-            echo "OK: ${DTB_NAME}.dtb included in $(basename "${dtbtar}")"
-          else
-            echo "Error: ${DTB_NAME}.dtb missing"; exit 1
-          fi
-
-          boottar="$(find /tmp/chk -name 'boot-rockchip-*.tar.gz' | head -1)"
-          mkdir -p /tmp/chk/boot && tar -xzf "${boottar}" -C /tmp/chk/boot
-          cfg="$(ls /tmp/chk/boot/config-* | head -1)"
-          echo "---- 生效的关键 config ----"
-          grep -E "^CONFIG_(DRM_ROCKCHIP|DRM_PANEL_ILITEK_ILI9881C|TOUCHSCREEN_GOODIX|USB_RTL8152|USB_NET_AX8817X|LOCALVERSION)=" "${cfg}"
-
-          modtar="$(find /tmp/chk -name 'modules-rockchip-*.tar.gz' | head -1)"
-          echo "---- 模块包 ----"; ls -lh "${modtar}"
+          set +e
+          {
+            echo "==== verify ===="
+            ls -lh "${out}" 2>/dev/null
+            pkg="$(ls "${out}"/*-rockchip.tar.gz 2>/dev/null | head -1)"
+            if [[ -n "${pkg}" ]]; then
+              rm -rf /tmp/chk && mkdir -p /tmp/chk
+              tar -xf "${pkg}" -C /tmp/chk
+              dtbtar="$(find /tmp/chk -name 'dtb-rockchip-*.tar.gz' | head -1)"
+              if tar -tzf "${dtbtar}" | grep -qx "${DTB_NAME}.dtb"; then
+                echo "OK: ${DTB_NAME}.dtb included"
+              else
+                echo "ERROR: ${DTB_NAME}.dtb missing"
+              fi
+              boottar="$(find /tmp/chk -name 'boot-rockchip-*.tar.gz' | head -1)"
+              mkdir -p /tmp/chk/boot && tar -xzf "${boottar}" -C /tmp/chk/boot
+              cfg="$(ls /tmp/chk/boot/config-* 2>/dev/null | head -1)"
+              echo "---- 生效的关键 config ----"
+              grep -E "^CONFIG_(DRM_ROCKCHIP|DRM_PANEL_ILITEK_ILI9881C|TOUCHSCREEN_GOODIX|USB_RTL8152|USB_NET_AX8817X|LOCALVERSION)=" "${cfg}"
+              echo "---- boot 包内容 ----"
+              ls /tmp/chk/boot | head -20
+            else
+              echo "no tar.gz produced"
+            fi
+          } 2>&1 | tee "${LOG}"
 
       - name: Upload Kernel to Release
         uses: ophub/upload-to-releases@main
-        if: ${{ steps.rekernel.outputs.status == 'success' && !cancelled() }}
+        if: ${{ steps.verify.outputs.status == 'success' && !cancelled() }}
         with:
           tag: kernel_fnnas
           artifacts: ${{ github.workspace }}/fnnas-src/fnnas/out/*
@@ -285,3 +288,34 @@ jobs:
               含本板专属设备树 `rk3568-firefly-aioj.dtb`；MIPI 屏(ILI9881C)、触摸(GT911)、
               百兆 USB 网卡(RTL8152/AX8817X) 已内建。
             - Self-built FnNAS kernel for Firefly AIO-3568J with board-specific DTB.
+
+      # 无论成败都打包日志发到公开 Release(tag: build-logs)，
+      # 这样在拿不到 Actions 日志（未登录不可见）时也能用附件排错。
+      - name: Bundle build logs
+        if: ${{ always() }}
+        run: |
+          mkdir -p "${LOG_DIR}"
+          {
+            echo "run_id: ${{ github.run_id }}"
+            echo "job_status: ${{ job.status }}"
+            echo "kernel: ${KVER}  series: ${SERIES}"
+            echo "dtb: ${DTB_NAME}"
+            echo
+            ls -lh "${LOG_DIR}" || true
+          } > "${LOG_DIR}/00-summary.txt"
+          ( cd "${LOG_DIR}" && tar -czf /builder/build-logs.tar.gz . ) || true
+          ls -lh /builder/build-logs.tar.gz || true
+
+      - name: Publish build logs
+        if: ${{ always() && !cancelled() }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: build-logs
+          artifacts: /builder/build-logs.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - Build logs of run ${{ github.run_id }} (status: ${{ job.status }}).
