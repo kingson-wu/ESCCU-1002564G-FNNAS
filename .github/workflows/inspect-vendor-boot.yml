@@ -25,8 +25,9 @@ jobs:
       - name: Download vendor image and dump boot info
         run: |
           set -eo pipefail
-          url="$(grep -v '^#' vendor/image-url.txt | head -1 | tr -d '\r\n ')"
-          f="${url%%\?*}"; f="$(basename "$f")"
+          url="$(awk 'NF && $0 !~ /^#/ {print $1; exit}' vendor/image-url.txt)"
+          echo "url: ${url%%\?*}..."
+          f="$(basename "${url%%\?*}")"
           mkdir -p /builder
           curl -fL --retry 3 "$url" -o "/builder/$f"
           cd /builder
