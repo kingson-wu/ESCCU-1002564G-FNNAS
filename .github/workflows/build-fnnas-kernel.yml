@@ -213,7 +213,13 @@ jobs:
           echo "image: ${img_name}" | tee -a "${LOG}"
           curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" \
             "${img_url}" -o "fnnas-arm64/${img_name}" 2>&1 | tail -3 | tee -a "${LOG}"
+          # rekernel 只查找 *.img，这里必须把 .img.xz 解压成 .img
+          if [[ "${img_name}" == *.xz ]]; then
+            echo "decompressing ${img_name} -> .img" | tee -a "${LOG}"
+            xz -d -T0 "fnnas-arm64/${img_name}" 2>&1 | tail -3 | tee -a "${LOG}"
+          fi
           ls -lh fnnas-arm64/ | tee -a "${LOG}"
+          ls fnnas-arm64/*.img >/dev/null 2>&1 || { echo "Error: no .img for rekernel."; exit 1; }
           echo "status=success" >> "${GITHUB_OUTPUT}"
 
       - name: Inject self-built debs and DTB, patch rekernel
@@ -222,7 +228,9 @@ jobs:
           set -eo pipefail
           LOG="${LOG_DIR}/06-inject.log"
           cd fnnas-src
-          cp -f /builder/*.deb fnnas-debs/rockchip/
+          cp -f /builder/linux-image-*.deb fnnas-debs/rockchip/
+          rm -f fnnas-debs/rockchip/*-dbg_*.deb
+          cp -f /builder/linux-headers-*.deb fnnas-debs/rockchip/ 2>/dev/null || true
           touch fnnas-debs/.self_built
           cp -f "${{ github.workspace }}/prebuilt/${DTB_NAME}.dtb" fnnas-dtbs/rockchip/ 2>/dev/null || true
           ls -l fnnas-debs/rockchip/ | tee "${LOG}"
