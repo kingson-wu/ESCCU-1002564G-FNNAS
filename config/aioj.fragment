@@ -1,0 +1,31 @@
+#==========================================================================
+# Firefly AIO-3568J (RK3568J) 自编内核裁剪片段
+#
+# 用法：以官方 config-<ver>-ophub 为基线（config/ 目录），再合并本片段：
+#   scripts/kconfig/merge_config.sh -m -O . .config ../config/aioj.fragment
+#   make ARCH=arm64 olddefconfig
+#
+# 为什么这么改：
+#   * 官方 ophub 6.18.63 config 里这些驱动其实都在，但全是 =m（模块）。
+#     模块要等 udev/modprobe 才加载，MIPI 屏在开机早期是黑的、触摸也要等。
+#     改成 =y 内建后，DRM/DSI/面板/触摸在启动阶段就 probe。
+#   * 第三网口是**百兆 USB 网卡**：RTL8152 系列(r8152) 或 ASIX AX88772/AX88179
+#     (ax88179_178a) 覆盖市面绝大多数百兆/千兆 USB 网卡，内建后插上即用。
+#   * 4G 模组：USB 侧的 CDC-ECM/NCM/MBIM、QMI_WWAN、串口 OPTION 在基线里已是 =m，
+#     只在需要"插上立刻可用"时才必须内建，保持 =m 即可（udev 会自动加载）。
+#
+# 想再加/减驱动，直接在本文件追加 CONFIG_xxx=y 或 =m，重跑工作流即可。
+#==========================================================================
+
+# ---- MIPI 屏(ILI9881C) 与触摸(GT911)：内建 ----
+CONFIG_DRM_ROCKCHIP=y
+CONFIG_DRM_PANEL_ILITEK_ILI9881C=y
+CONFIG_DRM_PANEL_SIMPLE=y
+CONFIG_TOUCHSCREEN_GOODIX=y
+
+# ---- 第三网口（百兆 USB 网卡）：内建 ----
+CONFIG_USB_RTL8152=y
+CONFIG_USB_NET_AX8817X=y
+
+# ---- 内核标识：保持与官方一致的 -ophub 后缀，命名/升级路径不变 ----
+CONFIG_LOCALVERSION="-ophub"
