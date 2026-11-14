@@ -13,6 +13,8 @@
 #     并把 extlinux.conf 的 linux / initrd / fdt 三行一起改。
 #   * 内核版本号必须从**包文件名**推断（boot-rockchip-6.18.63-ophub.tar.gz），
 #     不要 ls /usr/lib/modules 去猜（底镜像里可能有 6.1.0-xxx 之类的残留目录）。
+#   * 有些底镜像（如飞牛官方 roc-rk3568-pc）根本没有 extlinux.conf，dtb 由
+#     u-boot 按固定文件名加载，此时必须把同名 dtb 直接覆盖成本板 dtb。
 # ==========================================================================
 set -euo pipefail
 
@@ -102,6 +104,10 @@ mkdir -p "$B/dtb/rockchip"
 tar -xzf "$dtbtar" -C "$B/dtb/rockchip"
 [[ -f "$B/dtb/rockchip/$DTB_NAME" ]] || { echo "!! 本板 dtb 缺失"; exit 1; }
 echo "    dtb 总数: $(find "$B/dtb/rockchip" -name '*.dtb' | wc -l)"
+echo "--- boot 目录清单（排查引导方式用） ---"
+ls -l "$B" | head -40
+echo "--- 底镜像里 Firefly RK3568 系列 dtb ---"
+find "$B/dtb" -maxdepth 2 -name 'rk3568-firefly*' -o -maxdepth 2 -name 'rk3568-roc*' 2>/dev/null | head -20
 
 # ---------- 4) 模块 / headers ----------
 echo "==> 写入 /usr/lib/modules/${SUFFIX}"
@@ -139,6 +145,21 @@ for base in "$B" "$R/boot"; do
 done
 [[ $changed -eq 1 ]] || echo "!! 未找到 extlinux.conf / armbianEnv.txt"
 
+# ---------- 5b) 无引导配置时的兜底：覆盖 u-boot 按名字加载的 Firefly RK3568 dtb ----------
+if [[ $changed -eq 0 ]]; then
+    echo "==> 底镜像无引导配置，按 u-boot 固定文件名覆盖 dtb"
+    cnt=0
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        [[ "$(basename "$f")" == "$DTB_NAME" ]] && continue
+        cp -f "$B/dtb/rockchip/$DTB_NAME" "$f"
+        echo "    覆盖: ${f#"$B"/} ($(basename "$f"))"
+        cnt=$((cnt + 1))
+    done < <(find "$B/dtb/rockchip" -maxdepth 1 \( -name 'rk3568-firefly*.dtb' -o -name 'rk3568-roc*.dtb' -o -name 'rk3568-station*.dtb' \) 2>/dev/null)
+    echo "    共覆盖 ${cnt} 个 dtb"
+    [[ $cnt -gt 0 ]] || echo "!! 没有可覆盖的 Firefly RK3568 dtb 文件名，需要人工确认 u-boot 的 fdtfile"
+fi
+
 sync
 
 # ---------- 6) 报告 ----------
@@ -147,6 +168,7 @@ sync
     echo "vmlinuz link: vmlinuz -> $(readlink "$B/vmlinuz" 2>/dev/null || echo '(not a symlink)')"
     echo "uInitrd link: uInitrd -> $(readlink "$B/uInitrd" 2>/dev/null || echo '(not a symlink)')"
     echo "dtb: ${DTB_NAME} present at /boot/dtb/rockchip"
+    echo "fallback dtb override: ${cnt:-0} file(s)"
     echo "modules: /usr/lib/modules/${SUFFIX} ($(ls "$MDIR/kernel" | wc -l) groups)"
     echo "extlinux: $(grep -m1 'fdt' "$B/extlinux/extlinux.conf" 2>/dev/null || echo n/a)"
     echo "linux cfg: $(grep -m1 'linux ' "$B/extlinux/extlinux.conf" 2>/dev/null || echo n/a)"

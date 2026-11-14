@@ -1,1 +1,2 @@
 https://iso.liveupdate.fnnas.com/arm/image/1.2.0701/roc-rk3568-pc/fnos_Mainland-PE_arm_1.2.0701_roc-rk3568-pc_2882.img.gz?sign=4f2a73cbaf6f5dc6781450eaec3d6fc6&t=1794664248
+# rerun: fallback dtb override
