@@ -1,0 +1,49 @@
+name: Inspect Vendor Boot (read-only)
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect-vendor-boot.yml'
+      - 'scripts/inspect-boot.sh'
+  workflow_dispatch:
+
+env:
+  TZ: Etc/UTC
+
+jobs:
+  inspect:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootstrap
+        run: |
+          sudo apt-get -y update || true
+          sudo apt-get -y install util-linux xz-utils curl || true
+      - name: Download vendor image and dump boot info
+        run: |
+          set -eo pipefail
+          url="$(grep -v '^#' vendor/image-url.txt | head -1 | tr -d '\r\n ')"
+          f="${url%%\?*}"; f="$(basename "$f")"
+          mkdir -p /builder
+          curl -fL --retry 3 "$url" -o "/builder/$f"
+          cd /builder
+          gunzip -f "$f" 2>/dev/null || true
+          img="$(ls *.img | head -1)"
+          sudo bash "${{ github.workspace }}/scripts/inspect-boot.sh" "$img" /builder/info
+          ls -lh /builder/bootinfo.tar.gz
+      - name: Publish boot info
+        if: ${{ always() && !cancelled() }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: vendor_bootinfo
+          artifacts: /builder/bootinfo.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - Vendor image boot partition dump (boot.cmd / fnEnv.txt / file list).
