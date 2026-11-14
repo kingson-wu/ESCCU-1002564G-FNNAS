@@ -1,0 +1,195 @@
+#==========================================================================
+# 以「设备已验证能启动的 vendor 镜像」为基底，烤进自编 6.18.63 内核 + 本板 dtb
+#
+# 用法（两种，任选）：
+#   1) 把固件直链写进 vendor/image-url.txt 后 push → 自动触发
+#   2) Actions 页面 workflow_dispatch，填 vendor_url
+#
+# 产物：<NAME>-6.18.63-ophub.img.xz
+#   刷法（飞牛官方教程）：RKDevTool 选 MiniLoaderAll.bin + 这个 .img，
+#   或 rkdeveloptool db/ul loader 后 wl 0 写镜像
+#==========================================================================
+
+name: Build Vendor-Base Image (AIO-3568J)
+
+on:
+  push:
+    paths:
+      - 'vendor/image-url.txt'
+      - '.github/workflows/build-vendor-image.yml'
+  workflow_dispatch:
+    inputs:
+      vendor_url:
+        description: "vendor 固件直链（.img / .img.gz / .img.xz / .zip）"
+        required: true
+      kernel_version:
+        description: "自编内核版本（对应 kernel_fnnas Release 资产）"
+        required: true
+        default: "6.18.63"
+
+env:
+  TZ: Etc/UTC
+  KVER: ${{ inputs.kernel_version || '6.18.63' }}
+  LOG_DIR: /builder/logs
+
+jobs:
+  vendor-image:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 240
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/logs
+          LOG=/tmp/logs/00-bootstrap.log
+          {
+            echo "== bootstrap =="
+            date -u
+            df -Th /
+            sudo apt-get -y update || echo "warn: apt update failed"
+            for p in xz-utils util-linux e2fsprogs jq curl zip unzip ca-certificates; do
+              if dpkg -s "$p" >/dev/null 2>&1; then echo "ok: $p"
+              else sudo apt-get -y install "$p" && echo "installed: $p" || echo "warn: install $p failed"; fi
+            done
+            for t in losetup mount xz tar jq curl unzip; do
+              if command -v "$t" >/dev/null; then echo "found: $t"; else echo "MISSING: $t"; fi
+            done
+          } 2>&1 | tee "$LOG"
+          for t in losetup mount xz tar jq curl; do command -v "$t" >/dev/null || { echo "ERROR: missing $t"; exit 1; }; done
+
+      - name: Prepare build directory
+        run: |
+          set -o pipefail
+          LOG=/tmp/logs/01-builder.log
+          {
+            df -Th /
+            sudo mkdir -p /builder/logs
+            sudo chown -R runner:runner /builder 2>/dev/null || mkdir -p /builder
+            df -Th /builder
+          } 2>&1 | tee "$LOG"
+          [[ -w /builder ]] || { echo "ERROR: /builder not writable"; exit 1; }
+
+      - name: Fetch self-built kernel package
+        id: pkg
+        working-directory: /builder
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/02-pkg.log"
+          url="https://github.com/${{ github.repository }}/releases/download/kernel_fnnas/${KVER}-rockchip.tar.gz"
+          echo "kernel package: ${url}" | tee "${LOG}"
+          curl -fsSL --retry 5 -H "Authorization: Bearer ${GITHUB_TOKEN}" "${url}" -o "/builder/${KVER}-rockchip.tar.gz" 2>&1 | tail -3 | tee -a "${LOG}"
+          mkdir -p /builder/pkg
+          tar -xf "/builder/${KVER}-rockchip.tar.gz" -C /builder/pkg
+          pdir="$(find /builder/pkg -maxdepth 2 -name 'boot-rockchip-*.tar.gz' -printf '%h\n' | head -1)"
+          [[ -n "${pdir}" ]] || { echo "Error: kernel package layout unexpected."; exit 1; }
+          ls -lh "${pdir}" | tee -a "${LOG}"
+          echo "pkgdir=${pdir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download vendor image and normalize to .img
+        id: img
+        working-directory: /builder
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/03-vendor.log"
+          url="${{ inputs.vendor_url }}"
+          if [[ -z "${url}" && -f "${{ github.workspace }}/vendor/image-url.txt" ]]; then
+            url="$(head -1 "${{ github.workspace }}/vendor/image-url.txt" | tr -d '\r\n ')"
+          fi
+          [[ -n "${url}" && "${url}" != http* ]] && { echo "Error: 需要 http(s) 直链，当前: ${url}"; exit 1; }
+          echo "vendor url: ${url}" | tee "${LOG}"
+          fname="$(basename "${url%%\?*}")"
+          curl -fL --retry 5 "${url}" -o "/builder/${fname}" 2>&1 | tail -3 | tee -a "${LOG}"
+          ls -lh "/builder/${fname}" | tee -a "${LOG}"
+
+          cd /builder
+          case "${fname}" in
+            *.img)     img="${fname}" ;;
+            *.img.gz)  gunzip -f "${fname}"; img="${fname%.gz}" ;;
+            *.img.xz)  xz -d -T0 "${fname}"; img="${fname%.xz}" ;;
+            *.zip)     unzip -o "${fname}" -d vendor_unzip >/dev/null; img="$(find vendor_unzip -name '*.img' | head -1)" ;;
+            *.tar.gz|*.tgz) mkdir -p vendor_unzip; tar -xzf "${fname}" -C vendor_unzip; img="$(find vendor_unzip -name '*.img' | head -1)" ;;
+            *) echo "Error: 不认识的固件格式 ${fname}"; exit 1 ;;
+          esac
+          [[ -n "${img}" && -f "${img}" ]] || { echo "Error: 解压后找不到 .img"; ls -lh; exit 1; }
+          ls -lh "${img}" | tee -a "${LOG}"
+          file "${img}" | tee -a "${LOG}"
+          df -Th / | tee -a "${LOG}"
+          echo "img=${img}" >> "${GITHUB_OUTPUT}"
+
+      - name: Bake kernel into vendor image
+        id: bake
+        working-directory: /builder
+        run: |
+          set -eo pipefail
+          LOG="${LOG_DIR}/04-bake.log"
+          mkdir -p /builder/out
+          sudo bash "${{ github.workspace }}/scripts/build-full-image.sh" \
+            "${{ steps.img.outputs.img }}" "${{ steps.pkg.outputs.pkgdir }}" /builder/out "FnNAS-AIO3568J-VENDOR" 2>&1 | tee "${LOG}"
+          ls -lh /builder/out | tee -a "${LOG}"
+
+      - name: Verify built image
+        id: verify
+        if: ${{ always() }}
+        run: |
+          LOG="${LOG_DIR}/05-verify.log"
+          set +e
+          {
+            echo "==== verify ===="
+            ls -lh /builder/out 2>/dev/null
+            cat /builder/out/report.txt 2>/dev/null
+            imgxz="$(ls /builder/out/*.img.xz 2>/dev/null | head -1)"
+            if [[ -n "${imgxz}" ]]; then du -h "${imgxz}"; xz -l "${imgxz}" || true; echo "OK: ${imgxz}"; else echo "ERROR: no image produced"; fi
+          } 2>&1 | tee "${LOG}"
+          if [[ -n "$(ls /builder/out/*.img.xz 2>/dev/null)" ]]; then echo "status=success" >> "${GITHUB_OUTPUT}"; fi
+
+      - name: Publish image to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ always() && !cancelled() && steps.verify.outputs.status == 'success' }}
+        with:
+          tag: vendor_image
+          artifacts: /builder/out/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - vendor 基底镜像 + 自编内核 ${{ inputs.kernel_version || '6.18.63' }} + `rk3568-firefly-aioj.dtb`。
+            - 刷写：RKDevTool 选 MiniLoaderAll.bin 与该 .img；或 rkdeveloptool db/ul/wl 0。
+
+      - name: Bundle build logs
+        if: ${{ always() }}
+        run: |
+          mkdir -p "${LOG_DIR}"
+          {
+            echo "run_id: ${{ github.run_id }}"
+            echo "job_status: ${{ job.status }}"
+            echo "kernel: ${KVER}"
+            echo
+            ls -lh "${LOG_DIR}" || true
+          } > "${LOG_DIR}/00-summary.txt"
+          cp -f /tmp/logs/*.log "${LOG_DIR}/" 2>/dev/null || true
+          ( cd "${LOG_DIR}" && tar -czf /builder/vendor-build-logs.tar.gz . ) || true
+          ls -lh /builder/vendor-build-logs.tar.gz || true
+
+      - name: Publish build logs
+        if: ${{ always() && !cancelled() }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: build-logs-vendor
+          artifacts: /builder/vendor-build-logs.tar.gz
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - Vendor-base image build logs of run ${{ github.run_id }} (status: ${{ job.status }}).
