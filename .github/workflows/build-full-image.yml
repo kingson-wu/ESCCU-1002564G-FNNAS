@@ -47,25 +47,51 @@ jobs:
 
       - name: Initialize the build environment
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install xz-utils util-linux e2fsprogs jq curl ca-certificates
-          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
-          date -u
-          for t in losetup mount xz jq; do command -v "$t" || { echo "missing $t"; exit 1; }; done
+          set -o pipefail
+          mkdir -p /tmp/logs
+          LOG=/tmp/logs/00-bootstrap.log
+          {
+            echo "== bootstrap =="
+            date -u
+            df -Th
+            sudo apt-get -y update || echo "warn: apt update failed"
+            for p in xz-utils util-linux e2fsprogs jq curl xfsprogs ca-certificates; do
+              if dpkg -s "$p" >/dev/null 2>&1; then
+                echo "ok: $p"
+              else
+                sudo apt-get -y install "$p" && echo "installed: $p" || echo "warn: install $p failed"
+              fi
+            done
+            echo "== tool check =="
+            for t in losetup mount xz tar jq curl mkfs.xfs; do
+              if command -v "$t" >/dev/null; then echo "found: $t"; else echo "MISSING: $t"; fi
+            done
+            date -u
+          } 2>&1 | tee "$LOG"
+          for t in losetup mount xz tar jq curl; do command -v "$t" >/dev/null || { echo "ERROR: missing $t"; exit 1; }; done
 
       - name: Create virtual disk for extended storage
         run: |
-          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
-          root_size=$(( root_avail - 4 ))
-          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G"; exit 1; }
-          sudo truncate -s "${root_size}"G /root.img
-          build_dev=$(sudo losetup --find --show /root.img)
-          echo "Using /: ${root_size}G"
-          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
-          sudo mkdir -p /builder "${LOG_DIR}"
-          sudo mount "${build_dev}" /builder
-          sudo chown -R runner:runner /builder
-          df -Th
+          set -o pipefail
+          LOG=/tmp/logs/01-disk.log
+          {
+            root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+            root_size=$(( root_avail - 4 ))
+            echo "avail on /: ${root_avail}G, using ${root_size}G"
+            sudo truncate -s "${root_size}G" /root.img
+            build_dev=$(sudo losetup --find --show /root.img)
+            echo "loop: ${build_dev}"
+            if command -v mkfs.xfs >/dev/null; then
+              sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+            else
+              echo "mkfs.xfs missing, fallback to ext4"
+              sudo mkfs.ext4 -q -F "${build_dev}"
+            fi
+            sudo mkdir -p /builder "${LOG_DIR}"
+            sudo mount "${build_dev}" /builder
+            sudo chown -R runner:runner /builder
+            df -Th
+          } 2>&1 | tee "$LOG"
 
       - name: Fetch self-built kernel package from release
         id: pkg
@@ -74,7 +100,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eo pipefail
-          LOG="${LOG_DIR}/01-pkg.log"
+          LOG="${LOG_DIR}/02-pkg.log"
           url="https://github.com/${{ github.repository }}/releases/download/kernel_fnnas/${KVER}-rockchip.tar.gz"
           echo "kernel package: ${url}" | tee "${LOG}"
           curl -fsSL --retry 5 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
@@ -93,7 +119,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eo pipefail
-          LOG="${LOG_DIR}/02-image.log"
+          LOG="${LOG_DIR}/03-image.log"
           board="${{ inputs.fnnas_base_version || 'rockchip_1253' }}"
           latest=$(curl -s -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GITHUB_TOKEN}" \
@@ -120,7 +146,7 @@ jobs:
         working-directory: /builder
         run: |
           set -eo pipefail
-          LOG="${LOG_DIR}/03-bake.log"
+          LOG="${LOG_DIR}/04-bake.log"
           mkdir -p /builder/out
           sudo bash "${{ github.workspace }}/scripts/build-full-image.sh" \
             "${{ steps.img.outputs.img }}" "${{ steps.pkg.outputs.pkgdir }}" /builder/out 2>&1 | tee "${LOG}"
@@ -130,7 +156,7 @@ jobs:
         id: verify
         if: ${{ always() }}
         run: |
-          LOG="${LOG_DIR}/04-verify.log"
+          LOG="${LOG_DIR}/05-verify.log"
           set +e
           {
             echo "==== verify ===="
@@ -177,6 +203,7 @@ jobs:
             echo
             ls -lh "${LOG_DIR}" || true
           } > "${LOG_DIR}/00-summary.txt"
+          cp -f /tmp/logs/*.log "${LOG_DIR}/" 2>/dev/null || true
           ( cd "${LOG_DIR}" && tar -czf /builder/image-build-logs.tar.gz . ) || true
           ls -lh /builder/image-build-logs.tar.gz || true
 
