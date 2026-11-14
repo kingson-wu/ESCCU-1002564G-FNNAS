@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
-# 只读检查：把 vendor 镜像 boot 分区的 boot.cmd / fnEnv.txt / 文件名清单 dump 出来
-set -euo pipefail
-IMG="${1:?img}"
-OUT="${2:?outdir}"
+# 只读检查：dump vendor 镜像 boot 分区的 boot.cmd / fnEnv.txt / 文件清单
+# 注意：全程避免 `cmd | head` 之类在 pipefail 下会 SIGPIPE 的写法
+set -uo pipefail
+IMG="$1"
+OUT="$2"
 mkdir -p "$OUT"
 LOOP="$(losetup -Pf --show "$IMG")"
 trap 'losetup -d "$LOOP" 2>/dev/null || true' EXIT
 sleep 2
-lsblk -ln -o NAME,TYPE "$LOOP"
+lsblk -ln -o NAME,TYPE "$LOOP" || true
+
 for p in $(lsblk -ln -o NAME,TYPE "$LOOP" | awk '$2=="part"{print "/dev/"$1}'); do
     mkdir -p /mnt/p
-    if mount -o ro "$p" /mnt/p 2>/dev/null; then
+    if mount -o ro "$p" /mnt/p; then
+        f="$OUT/$(basename "$p").txt"
         {
             echo "=== $p ==="
-            ls -l /mnt/p | head -40
-            if [[ -f /mnt/p/fnEnv.txt ]]; then echo "--- fnEnv.txt ---"; cat /mnt/p/fnEnv.txt; fi
-            if [[ -f /mnt/p/boot.cmd ]]; then echo "--- boot.cmd ---"; cat /mnt/p/boot.cmd; fi
-            if [[ -f /mnt/p/boot.scr ]]; then echo "--- boot.scr strings ---"; strings /mnt/p/boot.scr | head -30; fi
-            if [[ -f /mnt/p/extlinux/extlinux.conf ]]; then echo "--- extlinux.conf ---"; cat /mnt/p/extlinux/extlinux.conf; fi
-        } > "$OUT/$(basename "$p").txt" 2>&1
-        umount /mnt/p
+            ls -l /mnt/p
+            [[ -f /mnt/p/fnEnv.txt ]] && { echo "--- fnEnv.txt ---"; cat /mnt/p/fnEnv.txt; }
+            [[ -f /mnt/p/boot.cmd ]] && { echo "--- boot.cmd ---"; cat /mnt/p/boot.cmd; }
+            [[ -f /mnt/p/boot.scr ]] && { echo "--- boot.scr strings ---"; strings /mnt/p/boot.scr; }
+            [[ -f /mnt/p/extlinux/extlinux.conf ]] && { echo "--- extlinux.conf ---"; cat /mnt/p/extlinux/extlinux.conf; }
+            [[ -d /mnt/p/dtb ]] && { echo "--- dtb names ---"; find /mnt/p/dtb -name 'rk3568*.dtb' -printf '%f\n'; }
+        } > "$f" 2>&1
+        umount /mnt/p || true
+    else
+        echo "skip $p (not mountable)" >> "$OUT/mount.log"
     fi
 done
-ls -l "$OUT"
-tar -czf "$OUT/../bootinfo.tar.gz" -C "$OUT" .
+tar -czf "$OUT/../bootinfo.tar.gz" -C "$OUT" . || true
+ls -l "$OUT/../bootinfo.tar.gz" || true

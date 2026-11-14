@@ -21,18 +21,20 @@ jobs:
       - name: Bootstrap
         run: |
           sudo apt-get -y update || true
-          sudo apt-get -y install util-linux xz-utils curl || true
+          sudo apt-get -y install util-linux xz-utils curl file || true
       - name: Download vendor image and dump boot info
         run: |
-          set -eo pipefail
+          set -e
           url="$(awk 'NF && $0 !~ /^#/ {print $1; exit}' vendor/image-url.txt)"
-          echo "url: ${url%%\?*}..."
+          echo "url: ${url}"
           f="$(basename "${url%%\?*}")"
           mkdir -p /builder
           curl -fL --retry 3 "$url" -o "/builder/$f"
           cd /builder
           gunzip -f "$f" 2>/dev/null || true
-          img="$(ls *.img | head -1)"
+          set -- /builder/*.img
+          img="$1"
+          echo "img: $img"
           sudo bash "${{ github.workspace }}/scripts/inspect-boot.sh" "$img" /builder/info
           ls -lh /builder/bootinfo.tar.gz
       - name: Publish boot info
