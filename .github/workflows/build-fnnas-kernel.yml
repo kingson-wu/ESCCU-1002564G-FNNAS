@@ -279,10 +279,15 @@ jobs:
               echo "no tar.gz produced"
             fi
           } 2>&1 | tee "${LOG}"
+          pkg_final="$(ls "${out}"/*-rockchip.tar.gz 2>/dev/null | head -1)"
+          if [[ -n "${pkg_final}" ]]; then
+            echo "package=${pkg_final}" >> "${GITHUB_OUTPUT}"
+            echo "status=success" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Upload Kernel to Release
         uses: ophub/upload-to-releases@main
-        if: ${{ steps.verify.outputs.status == 'success' && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.verify.outputs.status == 'success' }}
         with:
           tag: kernel_fnnas
           artifacts: ${{ github.workspace }}/fnnas-src/fnnas/out/*
